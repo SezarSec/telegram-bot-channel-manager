@@ -167,7 +167,7 @@ Contributions to improve this project are welcome! Please create a Pull Request 
 
 ### 📜 License
 
-This project is licensed under the [MIT License]. (You should create a `LICENSE` file with the MIT License content in your project root).
+This project is licensed under the [MIT License]
 
 ---
 ---
