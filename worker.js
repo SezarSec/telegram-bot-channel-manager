@@ -42,18 +42,53 @@ const USER_WELCOME_MESSAGE = `
 const FORCED_JOIN_MESSAGE = "کاربر گرامی، برای دریافت فایل ابتدا باید در کانال(های) زیر عضو شوید:\n";
 const POSTS_PER_PAGE = 5; 
 const USERS_PER_PAGE = 10; 
+const ANTI_SPAM_COOLDOWN_SECONDS = 20;
 const FILE_DELETION_DELAY_SECONDS = 15; 
 
 // Helper to escape MarkdownV2 special characters
 const escapeMarkdown = (text) => {
     if (typeof text !== 'string') return '';
-    // Characters to escape for MarkdownV2
-    // _ * [ ] ( ) ~ ` > # + - = | { } . !
     return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 };
 
+// --- Jalali / Gregorian Date Conversion ---
+function toGregorian(jy, jm, jd) {
+  const G_DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const J_DAYS_IN_MONTH = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29];
+
+  let gy = (jy <= 979) ? 621 : 1600;
+  jy -= (jy <= 979) ? 0 : 979;
+  let jy_day_no = 365 * jy + parseInt(jy / 33) * 8 + parseInt((jy % 33 + 3) / 4);
+  for (var i = 0; i < jm - 1; ++i) jy_day_no += J_DAYS_IN_MONTH[i];
+  jy_day_no += jd;
+  let g_day_no = jy_day_no + 79;
+  let gy_ = 1600 + 400 * parseInt(g_day_no / 146097);
+  g_day_no %= 146097;
+  let leap = true;
+  if (g_day_no >= 36525) {
+    g_day_no--;
+    gy_ += 100 * parseInt(g_day_no / 36524);
+    g_day_no %= 36524;
+    if (g_day_no >= 365) g_day_no++;
+    else leap = false;
+  }
+  gy_ += 4 * parseInt(g_day_no / 1461);
+  g_day_no %= 1461;
+  if (g_day_no >= 366) {
+    leap = false;
+    g_day_no--;
+    gy_ += parseInt(g_day_no / 365);
+    g_day_no %= 365;
+  }
+  for (var i = 0; g_day_no >= G_DAYS_IN_MONTH[i] + ((i === 1 && leap) ? 1 : 0); i++) g_day_no -= G_DAYS_IN_MONTH[i] + ((i === 1 && leap) ? 1 : 0);
+  let gm = i + 1;
+  let gd = g_day_no + 1;
+  return {gy: gy_, gm: gm, gd: gd};
+}
+
 
 export default {
+  // fetch handler for user interactions
   async fetch(request, env, ctx) {
     if (request.method === "POST") {
       try {
@@ -174,7 +209,7 @@ async function handleMessage(message, env, ctx) {
         if (command === "/addadmin") { await handleAddAdminCommand(chatId, payload, userId, env); return; }
         if (command === "/removeadmin") { await handleRemoveAdminCommand(chatId, payload, userId, env); return; }
         if (command === "/listadmins") { await handleListAdminsCommand(chatId, env); return; }
-        if (command === "/stats") { await handleStatsCommand(chatId, env); return; }
+        if (command === "/stats") { await handleStatsCommand(chatId, env, ctx); return; }
         if (command === "/listusers") { await sendUserList(chatId, env, 0, null, null); return;} 
         if (command === "/ban") { await handleBanUserCommand(chatId, payload, env, ctx); return; } 
         if (command === "/unban") { await handleUnbanUserCommand(chatId, payload, env, ctx); return; } 
@@ -196,6 +231,8 @@ async function handleMessage(message, env, ctx) {
   if (userState) {
     console.log(`[handleMessage] User ${userId} has state: ${JSON.stringify(userState)}`);
     if (userState.action === "new_post") { await handleNewPostFlow(message, userState, env); }
+    else if (userState.action === "awaiting_schedule_date") { await processScheduleDateInput(message, userId, env); }
+    else if (userState.action === "awaiting_schedule_time") { await processScheduleTimeInput(message, userId, env); }
     else if (userState.action === "awaiting_target_channel_add") { await processAddTargetChannelInput(message, userId, env); }
     else if (userState.action === "awaiting_target_channel_remove") { await processRemoveTargetChannelInput(message, userId, env); }
     else if (userState.action === "awaiting_user_id_to_ban") { await processBanUserInput(message, userId, env, ctx); } 
@@ -261,7 +298,7 @@ async function handleListAdminsCommand(chatId, env) {
     let adminListText = `ادمین اصلی: ${mainAdmin}\nسایر ادمین‌ها:\n${admins.length > 0 ? admins.map(id => `- ${id}`).join("\n") : "(موردی یافت نشد)"}`;
     await sendMessage(env.BOT_TOKEN, chatId, adminListText);
 }
-async function handleStatsCommand(chatId, env) {
+async function handleStatsCommand(chatId, env, ctx) {
     const users = await env.BOT_KV.get("bot_master_user_ids", { type: "json" }) || []; 
     
     let bannedCount = 0;
@@ -538,6 +575,80 @@ async function processDirectDeletePostInput(message, adminId, env) {
     await clearUserState(adminId, env); 
     await confirmPostDeletion(adminId, postId, env);
 }
+async function processScheduleDateInput(message, adminId, env) {
+    const text = message.text ? message.text.trim() : "";
+    if (text.toLowerCase() === "/cancel") {
+        await sendMessage(env.BOT_TOKEN, adminId, "زمانبندی لغو شد.");
+        await clearUserState(adminId, env);
+        return;
+    }
+    const dateRegex = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/;
+    const match = text.match(dateRegex);
+
+    if (!match) {
+        await sendMessage(env.BOT_TOKEN, adminId, "فرمت تاریخ نامعتبر است. لطفا با فرمت `YYYY/MM/DD` وارد کنید یا با /cancel لغو کنید.");
+        return;
+    }
+    
+    const [, year, month, day] = match.map(Number);
+    
+    const userState = await getUserState(adminId, env);
+    if (!userState || userState.action !== "awaiting_schedule_date") {
+        await sendMessage(env.BOT_TOKEN, adminId, "خطای داخلی. لطفا دوباره تلاش کنید.");
+        await clearUserState(adminId, env);
+        return;
+    }
+    
+    userState.schedule = { year, month, day };
+    userState.action = "awaiting_schedule_time";
+    await setUserState(adminId, userState, env);
+
+    const messageToSend = `تاریخ \`${text}\` دریافت شد\\.\n\nاکنون لطفا ساعت را با فرمت ۲۴ ساعته \`HH:MM\` وارد کنید \\(مثال: \`15:30\`\\) یا با /cancel لغو کنید\\.`;
+    await sendMessage(env.BOT_TOKEN, adminId, messageToSend, {parse_mode: "MarkdownV2"});
+}
+async function processScheduleTimeInput(message, adminId, env) {
+    const text = message.text ? message.text.trim() : "";
+    if (text.toLowerCase() === "/cancel") {
+        await sendMessage(env.BOT_TOKEN, adminId, "زمانبندی لغو شد.");
+        await clearUserState(adminId, env);
+        return;
+    }
+    const timeRegex = /^(\d{1,2}):(\d{2})$/;
+    const match = text.match(timeRegex);
+
+    if (!match) {
+        await sendMessage(env.BOT_TOKEN, adminId, "فرمت ساعت نامعتبر است. لطفا با فرمت `HH:MM` وارد کنید یا با /cancel لغو کنید.");
+        return;
+    }
+
+    const userState = await getUserState(adminId, env);
+    if (!userState || !userState.data || userState.action !== "awaiting_schedule_time" || !userState.schedule) {
+        await sendMessage(env.BOT_TOKEN, adminId, "خطای داخلی: اطلاعات پست یا تاریخ برای زمانبندی یافت نشد. لطفا دوباره تلاش کنید.");
+        await clearUserState(adminId, env);
+        return;
+    }
+    
+    const [, hour, minute] = match.map(Number);
+    const { year, month, day } = userState.schedule;
+    
+    // Convert Jalali to Gregorian
+    const gregorianDate = toGregorian(year, month, day);
+
+    // Convert Tehran time to UTC Date object
+    const tehranOffsetMinutes = (3 * 60) + 30;
+    const localDate = new Date(Date.UTC(gregorianDate.gy, gregorianDate.gm - 1, gregorianDate.gd, hour, minute)); 
+    const utcTime = localDate.getTime() - (tehranOffsetMinutes * 60 * 1000);
+
+    if (isNaN(utcTime) || utcTime <= Date.now()) {
+        await sendMessage(env.BOT_TOKEN, adminId, "تاریخ یا ساعت وارد شده نامعتبر یا در گذشته است. لطفا یک زمان در آینده وارد کنید.");
+        return;
+    }
+    
+    const scheduleTimestamp = Math.floor(utcTime / 1000); // Telegram needs Unix timestamp in seconds
+    await publishPost(userState.data, env, adminId, scheduleTimestamp);
+    await clearUserState(adminId, env);
+}
+
 
 
 async function startNewPostProcess(chatId, env) {
@@ -605,41 +716,64 @@ async function handleNewPostFlow(message, userState, env) {
       postData.content_file_type = fileType;
       if (contentText) postData.content_text = contentText; 
 
-      postData.creator_id = userId; postData.download_count = 0; postData.creation_date = new Date().toISOString();
-      await createAndSendPostToChannel(postData, env, chatId);
-      await clearUserState(userId, env);
+      postData.creator_id = userId; 
+      postData.download_count = 0; 
+      postData.creation_date = new Date().toISOString();
+
+      // Ask for publishing options
+      const publishingOptionsKeyboard = {
+          inline_keyboard: [
+              [
+                  { text: "✅ ارسال فوری", callback_data: "publish_now" },
+                  { text: "🕒 زمانبندی ارسال", callback_data: "publish_schedule" },
+                  { text: "❌ لغو", callback_data: "publish_cancel" }
+              ]
+          ]
+      };
+      userState.step = "awaiting_publish_option";
+      userState.data = postData; // Make sure postData is in the state
+      await setUserState(userId, userState, env);
+      await sendMessage(env.BOT_TOKEN, chatId, "محتوا دریافت شد. چگونه می‌خواهید پست را منتشر کنید؟", publishingOptionsKeyboard);
       break;
     default:
       await sendMessage(env.BOT_TOKEN, chatId, "خطای داخلی. با /newpost یا از پنل شروع کنید.");
       await clearUserState(userId, env);
   }
 }
-async function createAndSendPostToChannel(postData, env, adminChatId) {
+
+async function savePostData(postData, env) {
+    let postCounter = parseInt(await env.BOT_KV.get("posts:counter") || "0");
+    postCounter++;
+    const postId = postCounter.toString();
+    await env.BOT_KV.put("posts:counter", postId);
+
+    const finalPostData = { 
+        id: postId, 
+        ...postData, 
+        sent_to_channels: postData.sent_to_channels || [] 
+    };
+    await env.BOT_KV.put(`posts:${postId}`, JSON.stringify(finalPostData));
+    console.log(`Post ${postId} saved to KV.`);
+    return postId;
+}
+
+
+async function publishPost(postData, env, adminChatId = null, schedule_date = null) {
   const targetChannels = await env.BOT_KV.get("config:target_channels", { type: "json" }) || [];
   if (targetChannels.length === 0) { 
-      await sendMessage(env.BOT_TOKEN, adminChatId, "خطا: هیچ کانال هدفی تنظیم نشده است."); 
-      return; 
+      if (adminChatId) await sendMessage(env.BOT_TOKEN, adminChatId, "خطا: هیچ کانال هدفی تنظیم نشده است."); 
+      return { success: false }; 
   }
-
-  let postCounter = parseInt(await env.BOT_KV.get("posts:counter") || "0");
-  postCounter++;
-  const postId = postCounter.toString();
-  await env.BOT_KV.put("posts:counter", postId);
   
   const botUsername = env.BOT_USERNAME; 
   if (!botUsername && env.NODE_ENV !== 'test') { 
       console.error("BOT_USERNAME environment variable is not set.");
-      await sendMessage(env.BOT_TOKEN, adminChatId, "خطای پیکربندی: BOT_USERNAME تنظیم نشده.");
+      if (adminChatId) await sendMessage(env.BOT_TOKEN, adminChatId, "خطای پیکربندی: BOT_USERNAME تنظیم نشده.");
   }
-
-  const finalPostData = { 
-      id: postId, 
-      ...postData, 
-      sent_to_channels: [] 
-  };
-  await env.BOT_KV.put(`posts:${postId}`, JSON.stringify(finalPostData));
-
-
+  
+  // Save post data first to get an ID
+  const postId = await savePostData(postData, env);
+  
   const channelUsernameToDisplay = await env.BOT_KV.get("config:channel_username_display") || ""; 
   
   let caption = `🔢 کد شماره: ${postId}\n🗂 ${postData.title}\n\n📌 ${postData.description}\n\n`;
@@ -655,17 +789,24 @@ async function createAndSendPostToChannel(postData, env, adminChatId) {
           [{ text: statsButtonText, callback_data: `post_stats_display:${postId}`}] 
       ] 
   };
-  if (!botUsername && env.NODE_ENV !== 'test') { console.error("BOT_USERNAME is not set, download button URL malformed."); }
 
   let successfulSends = 0;
   const sentChannelInfo = []; 
 
   for (const targetChannel of targetChannels) {
       let responseData;
+      let params = { chat_id: targetChannel, reply_markup: JSON.stringify(replyMarkup) };
+      if (schedule_date) {
+        params.schedule_date = schedule_date;
+      }
+
       if (postData.image_file_id) {
-        responseData = await sendPhoto(env.BOT_TOKEN, targetChannel, postData.image_file_id, caption, replyMarkup);
+        params.photo = postData.image_file_id;
+        params.caption = caption;
+        responseData = await apiRequest(env.BOT_TOKEN, "sendPhoto", params);
       } else {
-        responseData = await sendMessage(env.BOT_TOKEN, targetChannel, caption, replyMarkup);
+        params.text = caption;
+        responseData = await apiRequest(env.BOT_TOKEN, "sendMessage", params);
       }
 
       if (responseData && responseData.ok) {
@@ -674,22 +815,39 @@ async function createAndSendPostToChannel(postData, env, adminChatId) {
             message_id: responseData.result.message_id
         });
         successfulSends++;
-        console.log(`Post ${postId} sent to channel ${targetChannel}, message_id: ${responseData.result.message_id}`);
+        console.log(`Post ${postId} ${schedule_date ? 'scheduled for' : 'sent to'} channel ${targetChannel}, message_id: ${responseData.result.message_id}`);
       } else {
-        console.error(`Failed to send post ${postId} to channel ${targetChannel}:`, responseData ? responseData.description : "Unknown error");
-        await sendMessage(env.BOT_TOKEN, adminChatId, `خطا در ارسال پست به کانال ${targetChannel}: ${responseData ? responseData.description : 'Unknown error'}.`);
+        console.error(`Failed to send/schedule post ${postId} to channel ${targetChannel}:`, responseData ? responseData.description : "Unknown error");
+        if (adminChatId) await sendMessage(env.BOT_TOKEN, adminChatId, `خطا در ارسال/زمانبندی پست به کانال ${targetChannel}: ${responseData ? responseData.description : 'Unknown error'}.`);
       }
       await new Promise(resolve => setTimeout(resolve, 200)); 
   }
   
-  if (successfulSends > 0) {
-    finalPostData.sent_to_channels = sentChannelInfo; 
-    await env.BOT_KV.put(`posts:${postId}`, JSON.stringify(finalPostData)); 
-    await sendMessage(env.BOT_TOKEN, adminChatId, `پست ${postId} با موفقیت به ${successfulSends} کانال از ${targetChannels.length} کانال ارسال شد.`);
-  } else {
-    await sendMessage(env.BOT_TOKEN, adminChatId, `ارسال پست ${postId} به هیچ یک از کانال‌های هدف موفقیت آمیز نبود.`);
+  const postKey = `posts:${postId}`;
+  const finalPostData = await env.BOT_KV.get(postKey, {type: "json"});
+  if (finalPostData) {
+      finalPostData.sent_to_channels = sentChannelInfo;
+      await env.BOT_KV.put(postKey, JSON.stringify(finalPostData));
   }
+  
+  if (successfulSends > 0 && adminChatId) {
+    if (schedule_date) {
+        await sendMessage(env.BOT_TOKEN, adminChatId, `پست ${postId} با موفقیت برای ارسال در ${successfulSends} کانال زمانبندی شد.`);
+    } else {
+        await sendMessage(env.BOT_TOKEN, adminChatId, `پست ${postId} با موفقیت به ${successfulSends} کانال از ${targetChannels.length} کانال ارسال شد.`);
+    }
+  } else if (adminChatId) {
+    await sendMessage(env.BOT_TOKEN, adminChatId, `ارسال/زمانبندی پست ${postId} به هیچ یک از کانال‌های هدف موفقیت آمیز نبود.`);
+  }
+
+  return { success: successfulSends > 0, postId: postId };
 }
+
+// Renamed from saveAndPublishPost for clarity
+async function publishPostNow(postData, env, adminChatId) {
+    return await publishPost(postData, env, adminChatId, null);
+}
+
 
 async function sendAdminPanel(chatId, env) {
     const adminPanelKeyboard = {
@@ -837,8 +995,7 @@ async function sendUserList(chatId, env, page = 0, messageIdToEdit = null, callb
     const paginatedUserIds = sortedUserIds.slice(startIndex, endIndex);
     console.log(`[sendUserList] Users for page ${page} (count: ${paginatedUserIds.length}):`, paginatedUserIds.join(", "));
 
-    // Corrected line with escaped parentheses for static text
-    let messageText = `لیست کاربران \\(صفحه ${page + 1} از ${Math.ceil(sortedUserIds.length / USERS_PER_PAGE)}\\):\n\n`;
+    let messageText = `لیست کاربران \\(صفحه ${page + 1} از ${Math.ceil(sortedUserIds.length / USERS_PER_PAGE)}\\):\n\n`; // Escaped parentheses
     const keyboardRows = []; 
 
     if (paginatedUserIds.length === 0 && page === 0) {
@@ -864,7 +1021,7 @@ async function sendUserList(chatId, env, page = 0, messageIdToEdit = null, callb
                 userName = "[پروفایل یافت نشد]";
             }
             const escapedUserName = escapeMarkdown(userName);
-            const escapedBanStatus = escapeMarkdown(banStatus); // Escape ban status too
+            const escapedBanStatus = escapeMarkdown(banStatus); 
             // Ensure the leading hyphen for list items is also escaped for MarkdownV2
             messageText += `\\- ID: \`${userId}\`${escapedUserName ? ` \\- ${escapedUserName}` : ""}${escapedBanStatus}\n`;
         }
@@ -888,10 +1045,10 @@ async function sendUserList(chatId, env, page = 0, messageIdToEdit = null, callb
     try {
         if (messageIdToEdit) {
             console.log(`[sendUserList] Attempting to edit message ${messageIdToEdit}`);
-            await editMessageText(env.BOT_TOKEN, chatId, messageIdToEdit, messageText, { reply_markup: replyMarkup, parse_mode: "MarkdownV2"});
+            await editMessageText(env.BOT_TOKEN, chatId, messageIdToEdit, messageText, { ...replyMarkup, ...messageOptions});
         } else {
             console.log(`[sendUserList] Attempting to send new message`);
-            await sendMessage(env.BOT_TOKEN, chatId, messageText, { reply_markup: replyMarkup, parse_mode: "MarkdownV2"});
+            await sendMessage(env.BOT_TOKEN, chatId, messageText, { ...replyMarkup, ...messageOptions});
         }
         if (callbackQueryIdToAnswer) {
             console.log(`[sendUserList] Answering callback query ${callbackQueryIdToAnswer}`);
@@ -915,7 +1072,7 @@ async function handleCallbackQuery(callbackQuery, env, ctx) {
 
   const userIsAdmin = await isAdmin(userId, env);
 
-  if (!userIsAdmin && (data.startsWith("admin_panel_") || data.startsWith("admin_confirm_delete_post:") || data.startsWith("admin_cancel_delete_post:") || data.startsWith("admin_confirm_delete_post_from_list_prompt:") || data.startsWith("post_stats_display:"))) {
+  if (!userIsAdmin && (data.startsWith("admin_panel_") || data.startsWith("admin_confirm_delete_post:") || data.startsWith("admin_cancel_delete_post:") || data.startsWith("admin_confirm_delete_post_from_list_prompt:") || data.startsWith("post_stats_display:") || data.startsWith("schedule_"))) {
       await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, "شما اجازه انجام این عملیات را ندارید.", true);
       return;
   }
@@ -928,7 +1085,44 @@ async function handleCallbackQuery(callbackQuery, env, ctx) {
     } 
     catch (e) { console.error("[handleCallbackQuery] Failed to delete previous message:", e.message, e.stack); }
   };
-
+  
+  if (data === "publish_now") {
+        const userState = await getUserState(userId, env);
+        if (userState && userState.action === "new_post" && userState.step === "awaiting_publish_option") {
+            await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, "در حال ارسال فوری پست...");
+            await deletePreviousMessage(messageId);
+            await publishPost(userState.data, env, chatId); 
+            await clearUserState(userId, env);
+        }
+        return;
+  }
+  if (data === "publish_schedule") {
+        const userState = await getUserState(userId, env);
+        if (userState && userState.action === "new_post" && userState.step === "awaiting_publish_option") {
+            await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId);
+            userState.action = "awaiting_schedule_date"; // Start new 2-step text flow
+            await setUserState(userId, userState, env);
+            const today = new Date();
+            // Use Intl.DateTimeFormat for reliable Jalali date formatting with correct timezone
+            const jalaliTodayFormatted = new Intl.DateTimeFormat('fa-IR-u-nu-latn', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                timeZone: 'Asia/Tehran'
+            }).format(today);
+            
+            await deletePreviousMessage(messageId);
+            await sendMessage(env.BOT_TOKEN, chatId, `لطفا تاریخ انتشار پست را با فرمت زیر ارسال کنید:\n\n` + '`YYYY/MM/DD`' + `\n\nمثال \\(تاریخ امروز\\): \`${jalaliTodayFormatted}\`\n\nیا با ارسال /cancel لغو کنید\\.`, {parse_mode: "MarkdownV2"});
+        }
+        return;
+  }
+  if (data === "publish_cancel") {
+        await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, "ارسال پست لغو شد.");
+        await deletePreviousMessage(messageId);
+        await clearUserState(userId, env);
+        return;
+  }
+  
   if (data === "admin_panel_main") {
     await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId);
     await deletePreviousMessage();
@@ -996,17 +1190,8 @@ async function handleCallbackQuery(callbackQuery, env, ctx) {
   }
   
    if (data === "admin_panel_stats") {
-    const users = await env.BOT_KV.get("bot_master_user_ids", { type: "json" }) || []; 
-    let bannedCount = 0;
-    if (users.length > 0) {
-        for (const uId of users) {
-            const userProfile = await env.BOT_KV.get(`user_profile:${uId}`, {type: "json"});
-            if (userProfile && userProfile.is_banned) {
-                bannedCount++;
-            }
-        }
-    }
-    await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, `📊 آمار ربات:\nکل کاربران ثبت شده: ${users.length}\nکاربران مسدود: ${bannedCount}`, true);
+    await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, "در حال محاسبه آمار، لطفا صبر کنید...");
+    ctx.waitUntil(handleStatsCommand(chatId, env, ctx)); 
     return;
   }
   if (data === "admin_panel_user_management") {
@@ -1106,6 +1291,16 @@ async function processPostDownload(postId, userId, callbackQueryId, env, userCha
 
   let post = JSON.parse(postJson);
   console.log(`[processPostDownload] Post ${postId} data fetched.`);
+  
+  const cooldownKey = `cooldown:${userId}`;
+  const isOnCooldown = await env.BOT_KV.get(cooldownKey);
+  if (isOnCooldown) {
+      console.log(`[processPostDownload] User ${userId} is on cooldown.`);
+      const waitMessage = `لطفا ${ANTI_SPAM_COOLDOWN_SECONDS} ثانیه صبر کنید و دوباره تلاش نمایید.`;
+      if (!isFromStartCommand && callbackQueryId) await answerCallbackQuery(env.BOT_TOKEN, callbackQueryId, waitMessage, true);
+      else if (isFromStartCommand) await sendMessage(env.BOT_TOKEN, userChatId, waitMessage);
+      return;
+  }
 
   const userProfileKey = `user_profile:${userId}`;
   const userProfile = await env.BOT_KV.get(userProfileKey, { type: "json" });
@@ -1164,20 +1359,33 @@ async function processPostDownload(postId, userId, callbackQueryId, env, userCha
     return;
   }
 
+  // Set cooldown BEFORE attempting to send, to prevent spam
+  ctx.waitUntil(env.BOT_KV.put(cooldownKey, "true", { expirationTtl: ANTI_SPAM_COOLDOWN_SECONDS }));
+
+  // Check if user has downloaded this specific post before
+  const userDownloadKey = `download:${postId}:${userId}`;
+  const hasDownloaded = await env.BOT_KV.get(userDownloadKey);
+
   console.log(`[processPostDownload] Attempting to send file/text for post ${postId} to user ${userId}. Type: ${post.content_file_type}`);
   const sentFileResponse = await sendFileToUser(env.BOT_TOKEN, userChatId, post.content_file_id, post.content_file_type, post.content_text);
 
   if (sentFileResponse && sentFileResponse.ok) {
     console.log(`[processPostDownload] File/Text for post ${postId} sent successfully to user ${userId}. Message ID: ${sentFileResponse.result.message_id}`);
-    post.download_count += 1;
     
-    const updatePostDataTask = env.BOT_KV.put(postKey, JSON.stringify(post));
-    if (ctx && ctx.waitUntil) { ctx.waitUntil(updatePostDataTask); } 
-    else { await updatePostDataTask; }
-
-    console.log(`[processPostDownload] Download count for post ${postId} update initiated.`);
+    // Only increment download count if user has NOT downloaded before
+    if (!hasDownloaded) {
+        post.download_count += 1;
+        // Mark as downloaded
+        ctx.waitUntil(env.BOT_KV.put(userDownloadKey, "true")); 
+        // Update the main post data with new count
+        ctx.waitUntil(env.BOT_KV.put(postKey, JSON.stringify(post)));
+        console.log(`[processPostDownload] First time download. Download count for post ${postId} update queued to ${post.download_count}.`);
+    } else {
+        console.log(`[processPostDownload] Repeat download for user ${userId}. Count not incremented.`);
+    }
     
-    if (post.sent_to_channels && Array.isArray(post.sent_to_channels)) {
+    // Update the stats button in the channel(s) if it was the first download for this user
+    if (!hasDownloaded && post.sent_to_channels && Array.isArray(post.sent_to_channels)) {
         const newStatsButtonText = `تعداد دانلود : ${post.download_count} از ${post.limit === 0 ? 'نامحدود' : post.limit}`;
         const botUsername = env.BOT_USERNAME || 'YOUR_BOT_USERNAME_FALLBACK';
         const newReplyMarkupForChannel = {
@@ -1193,8 +1401,7 @@ async function processPostDownload(postId, userId, callbackQueryId, env, userCha
                     message_id: sentInfo.message_id,
                     reply_markup: JSON.stringify(newReplyMarkupForChannel)
                 }).catch(e => console.error(`Failed to update stats button in ${sentInfo.channel_id} for msg ${sentInfo.message_id}:`, e));
-                if (ctx && ctx.waitUntil) { ctx.waitUntil(editTask); }
-                else { await editTask; } 
+                ctx.waitUntil(editTask);
             }
         }
     }
@@ -1209,34 +1416,28 @@ async function processPostDownload(postId, userId, callbackQueryId, env, userCha
         await sendMessage(env.BOT_TOKEN, userChatId, confirmationMessage);
     }
     
-    if (post.content_file_type !== "text_message") {
-        const deletionTask = async () => {
-            console.log(`[DeletionTask] Scheduled for message ${sentContentMessageId} in chat ${userChatId} after ${FILE_DELETION_DELAY_SECONDS}s.`);
-            await new Promise(resolve => setTimeout(resolve, FILE_DELETION_DELAY_SECONDS * 1000));
-            try {
-                console.log(`[DeletionTask] Attempting to delete message ${sentContentMessageId} for user ${userChatId}.`);
-                const deleteOp = await apiRequest(env.BOT_TOKEN, "deleteMessage", {
-                    chat_id: userChatId,
-                    message_id: sentContentMessageId
-                });
-                if (deleteOp.ok) {
-                     console.log(`[DeletionTask] File message ${sentContentMessageId} deleted for user ${userChatId}.`);
-                } else {
-                     console.error(`[DeletionTask] Telegram API failed to delete message ${sentContentMessageId} for user ${userChatId}: ${deleteOp.description}`);
-                }
-            } catch (e) {
-                console.error(`[DeletionTask] Exception during scheduled deletion of message ${sentContentMessageId} for user ${userChatId}:`, e.message, e.stack);
+    const deletionTask = async () => {
+        console.log(`[DeletionTask] Scheduled for message ${sentContentMessageId} in chat ${userChatId} after ${FILE_DELETION_DELAY_SECONDS}s.`);
+        await new Promise(resolve => setTimeout(resolve, FILE_DELETION_DELAY_SECONDS * 1000));
+        try {
+            console.log(`[DeletionTask] Attempting to delete message ${sentContentMessageId} for user ${userChatId}.`);
+            const deleteOp = await apiRequest(env.BOT_TOKEN, "deleteMessage", {
+                chat_id: userChatId,
+                message_id: sentContentMessageId
+            });
+            if (deleteOp.ok) {
+                 console.log(`[DeletionTask] File message ${sentContentMessageId} deleted for user ${userChatId}.`);
+            } else {
+                 console.error(`[DeletionTask] Telegram API failed to delete message ${sentContentMessageId} for user ${userChatId}: ${deleteOp.description}`);
             }
-        };
-
-        if (ctx && ctx.waitUntil) {
-          console.log("[processPostDownload] Using ctx.waitUntil for deletion task.");
-          ctx.waitUntil(deletionTask());
-        } else {
-          console.warn("[processPostDownload] ctx or ctx.waitUntil not available. Auto-deletion might not complete reliably.");
-          deletionTask(); 
+        } catch (e) {
+            console.error(`[DeletionTask] Exception during scheduled deletion of message ${sentContentMessageId} for user ${userChatId}:`, e.message, e.stack);
         }
-    }
+    };
+
+    ctx.waitUntil(deletionTask());
+    console.log("[processPostDownload] Using ctx.waitUntil for deletion task.");
+
   } else { 
     console.error("[processPostDownload] Failed to send file/text to user:", sentFileResponse);
     const errorMessage = "خطا در ارسال فایل/پیام. لطفا دوباره تلاش کنید.";
